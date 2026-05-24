@@ -3,36 +3,30 @@ stock_analyzer.py — ดึงข้อมูลและวิเคราะ�
 """
 
 import asyncio
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 import pytz
 import pandas as pd
-import numpy as np
 import yfinance as yf
 
 
 class StockAnalyzer:
 
-    THAI_SUFFIXES = [".BK"]
-    THAI_STOCKS_NO_SUFFIX = {
-        # หุ้นไทยที่ user พิมพ์แค่ชื่อย่อ เช่น PTT → PTT.BK
+    THAI_STOCKS = {
         "PTT", "AOT", "KBANK", "SCB", "BBL", "ADVANC", "DTAC",
         "CPALL", "TRUE", "MINT", "BH", "TU", "IVL", "SCC", "PTTEP",
         "GULF", "RATCH", "BCPG", "EA", "WHA", "CPN", "MAJOR",
     }
 
-    def _resolve_symbol(self, symbol: str) -> tuple[str, bool]:
-        """คืนค่า (yfinance_symbol, is_thai)"""
-        # ถ้าลงท้าย .BK แล้ว
-        if symbol.endswith(".BK"):
-            return symbol, True
-        # ถ้าอยู่ใน whitelist หุ้นไทย
-        if symbol in self.THAI_STOCKS_NO_SUFFIX:
-            return f"{symbol}.BK", True
-        return symbol, False
+    def _resolve_symbol(self, symbol: str) -> tuple:
+        s = symbol.upper().strip()
+        if s.endswith(".BK"):
+            return s, True
+        if s in self.THAI_STOCKS:
+            return f"{s}.BK", True
+        return s, False
 
     async def analyze(self, symbol_input: str) -> dict:
         symbol, is_thai = self._resolve_symbol(symbol_input)
-
         try:
             data = await asyncio.to_thread(self._fetch_and_calc, symbol, is_thai)
             return data
@@ -41,19 +35,19 @@ class StockAnalyzer:
 
     def _fetch_and_calc(self, symbol: str, is_thai: bool) -> dict:
         ticker = yf.Ticker(symbol)
-        hist = ticker.history(period="30d")
+        hist = ticker.history(period="30d", auto_adjust=True)
 
-        if hist.empty or len(hist) < 5:
+        if hist is None or hist.empty or len(hist) < 5:
             raise ValueError(f"ไม่พบข้อมูลสำหรับ {symbol}")
 
-        close = hist["Close"]
+        close = hist["Close"].dropna()
+        if len(close) < 5:
+            raise ValueError(f"ข้อมูลไม่เพียงพอสำหรับ {symbol}")
 
-        # ─── Indicators ───────────────────────────────────
-        avg_5 = close.tail(5).mean()
+        avg_5 = float(close.tail(5).mean())
 
-        # RSI (14)
-        rsi = self._calc_rsi(close, 14)
-        rsi_val = rsi.iloc[-1]
+        # RSI
+        rsi_val = self._calc_rsi(close)
         if rsi_val < 30:
             rsi_signal = "Oversold"
         elif rsi_val > 70:
@@ -61,20 +55,23 @@ class StockAnalyzer:
         else:
             rsi_signal = "Neutral"
 
-        # MACD (12, 26, 9)
-        macd_line, signal_line = self._calc_macd(close)
-        macd_signal = "Bullish" if macd_line.iloc[-1] > signal_line.iloc[-1] else "Bearish"
+        # MACD
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        macd = ema12 - ema26
+        signal = macd.ewm(span=9, adjust=False).mean()
+        macd_signal = "Bullish" if float(macd.iloc[-1]) > float(signal.iloc[-1]) else "Bearish"
 
-        # Bollinger Bands (20)
+        # Bollinger Bands
         bb_mid = close.rolling(20).mean()
         bb_std = close.rolling(20).std()
-        bb_upper = (bb_mid + 2 * bb_std).iloc[-1]
-        bb_lower = (bb_mid - 2 * bb_std).iloc[-1]
+        bb_upper = float((bb_mid + 2 * bb_std).iloc[-1])
+        bb_lower = float((bb_mid - 2 * bb_std).iloc[-1])
 
         # Momentum
-        price_now = close.iloc[-1]
-        price_5d_ago = close.iloc[-5]
-        change_pct = (price_now - price_5d_ago) / price_5d_ago * 100
+        price_now = float(close.iloc[-1])
+        price_5d = float(close.iloc[-5])
+        change_pct = (price_now - price_5d) / price_5d * 100
         if change_pct > 2:
             momentum = "Uptrend"
         elif change_pct < -2:
@@ -82,8 +79,8 @@ class StockAnalyzer:
         else:
             momentum = "Sideways"
 
-        # Volatility (std ของ daily return 10 วัน)
-        daily_ret = close.pct_change().tail(10).std() * 100
+        # Volatility
+        daily_ret = float(close.pct_change().tail(10).std() * 100)
         if daily_ret > 3:
             volatility = "High"
         elif daily_ret > 1.5:
@@ -91,13 +88,14 @@ class StockAnalyzer:
         else:
             volatility = "Low"
 
-        # เวลา GMT+7
         tz = pytz.timezone("Asia/Bangkok")
         updated = datetime.now(tz).strftime("%Y-%m-%d %H:%M")
 
+        display = symbol.replace(".BK", "") if is_thai else symbol
+
         return {
             "error": None,
-            "symbol": symbol.replace(".BK", "") if is_thai else symbol,
+            "symbol": display,
             "is_thai": is_thai,
             "updated": f"{updated} (GMT+7)",
             "momentum": momentum,
@@ -112,18 +110,10 @@ class StockAnalyzer:
             "change_pct": change_pct,
         }
 
-    # ─── Helper: RSI ──────────────────────────────────────
-    def _calc_rsi(self, series: pd.Series, period: int = 14) -> pd.Series:
-        delta = series.diff()
+    def _calc_rsi(self, series: pd.Series, period: int = 14) -> float:
+        delta = series.diff().dropna()
         gain = delta.clip(lower=0).rolling(period).mean()
         loss = (-delta.clip(upper=0)).rolling(period).mean()
         rs = gain / loss
-        return 100 - (100 / (1 + rs))
-
-    # ─── Helper: MACD ─────────────────────────────────────
-    def _calc_macd(self, series: pd.Series):
-        ema12 = series.ewm(span=12, adjust=False).mean()
-        ema26 = series.ewm(span=26, adjust=False).mean()
-        macd_line = ema12 - ema26
-        signal_line = macd_line.ewm(span=9, adjust=False).mean()
-        return macd_line, signal_line
+        rsi = 100 - (100 / (1 + rs))
+        return float(rsi.iloc[-1])
