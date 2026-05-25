@@ -1,6 +1,5 @@
 """
-stock_analyzer.py — ดึงข้อมูลและวิเคราะห์หุ้น US + Thai
-แก้ปัญหา Yahoo Finance block โดยใช้ requests session + headers
+stock_analyzer.py — ดึงข้อมูลหุ้น US + Thai ด้วย Alpha Vantage API
 """
  
 import asyncio
@@ -8,35 +7,25 @@ from datetime import datetime
 import pytz
 import pandas as pd
 import requests
-import yfinance as yf
+import os
  
  
-def _get_session():
-    """สร้าง session ที่จำลองเป็น browser เพื่อหลีกเลี่ยงการ block"""
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-    })
-    return session
+ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY", "")
+ 
+THAI_STOCKS = {
+    "PTT", "AOT", "KBANK", "SCB", "BBL", "ADVANC",
+    "CPALL", "TRUE", "MINT", "BH", "TU", "IVL", "SCC", "PTTEP",
+    "GULF", "RATCH", "EA", "WHA", "CPN", "MAJOR",
+}
  
  
 class StockAnalyzer:
- 
-    THAI_STOCKS = {
-        "PTT", "AOT", "KBANK", "SCB", "BBL", "ADVANC", "DTAC",
-        "CPALL", "TRUE", "MINT", "BH", "TU", "IVL", "SCC", "PTTEP",
-        "GULF", "RATCH", "BCPG", "EA", "WHA", "CPN", "MAJOR",
-    }
  
     def _resolve_symbol(self, symbol: str) -> tuple:
         s = symbol.upper().strip()
         if s.endswith(".BK"):
             return s, True
-        if s in self.THAI_STOCKS:
+        if s in THAI_STOCKS:
             return f"{s}.BK", True
         return s, False
  
@@ -49,17 +38,36 @@ class StockAnalyzer:
             return {"error": str(e)}
  
     def _fetch_and_calc(self, symbol: str, is_thai: bool) -> dict:
-        session = _get_session()
-        ticker = yf.Ticker(symbol, session=session)
-        hist = ticker.history(period="30d", auto_adjust=True)
+        # Alpha Vantage ใช้ BKK: แทน .BK
+        av_symbol = symbol.replace(".BK", "")
+        if is_thai:
+            av_symbol = f"BKK:{av_symbol}"
  
-        if hist is None or hist.empty or len(hist) < 5:
-            # ลอง period สั้นกว่า
-            hist = ticker.history(period="5d", auto_adjust=True)
-            if hist is None or hist.empty:
-                raise ValueError(f"ไม่พบข้อมูลสำหรับ {symbol}")
+        url = "https://www.alphavantage.co/query"
+        params = {
+            "function": "TIME_SERIES_DAILY",
+            "symbol": av_symbol,
+            "outputsize": "compact",
+            "apikey": ALPHA_VANTAGE_KEY,
+        }
  
-        close = hist["Close"].dropna()
+        resp = requests.get(url, params=params, timeout=15)
+        data = resp.json()
+ 
+        # ตรวจ error
+        if "Error Message" in data:
+            raise ValueError(f"ไม่พบข้อมูลสำหรับ {symbol}")
+        if "Note" in data:
+            raise ValueError("API limit reached — ลองใหม่อีก 1 นาที")
+        if "Time Series (Daily)" not in data:
+            raise ValueError(f"ไม่พบข้อมูลสำหรับ {symbol}")
+ 
+        ts = data["Time Series (Daily)"]
+        df = pd.DataFrame.from_dict(ts, orient="index")
+        df.index = pd.to_datetime(df.index)
+        df = df.sort_index()
+        close = df["4. close"].astype(float).tail(30)
+ 
         if len(close) < 3:
             raise ValueError(f"ข้อมูลไม่เพียงพอสำหรับ {symbol}")
  
