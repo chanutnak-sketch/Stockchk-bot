@@ -10,7 +10,7 @@ import requests
 import os
  
  
-ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY", "")
+ALPHA_VANTAGE_KEY = os.getenv("ALPHA_VANTAGE_KEY", "2C3N1N8PAF24P8VD")
  
 THAI_STOCKS = {
     "PTT", "AOT", "KBANK", "SCB", "BBL", "ADVANC",
